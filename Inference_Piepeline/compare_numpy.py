@@ -5,6 +5,14 @@ import numpy as np
 from scipy.signal import find_peaks, medfilt
 import csv
 
+'''
+This script runs a C binary that tests various numpy-like functions implemented in C.
+It captures the output, which includes function name, test ID, and output values. It then computes the expected results using numpy and compares them
+to the C implementation's output. The results, including maximum absolute differences, are written to a CSV file.
+
+'''
+
+
 def parse_complex_list(s):
     vals = []
     for tok in s.split(";"):

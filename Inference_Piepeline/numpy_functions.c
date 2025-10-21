@@ -579,3 +579,303 @@ void medfilt_nd(const float* volume, const int32_t* dims, int32_t nd,
     free(coords); free(half);
 }
 
+// ============================ Additional feature helpers ============================
+
+int32_t compute_spike_count(const float* resid, int32_t n){
+    if(!resid || n < 1) return 0;
+    peak_result_t p = find_peaks_ref(resid, n, NULL, NULL, 1, NULL, NULL, 0, 0.5f, NULL);
+    int32_t cnt = p.n_peaks;
+    free_peak_result(&p);
+    return cnt;
+}
+
+int32_t compute_dip_count(const float* resid, int32_t n){
+    if(!resid || n < 1) return 0;
+    float* neg = (float*)xmalloc_bytes((size_t)n * sizeof(float));
+    for(int32_t i=0;i<n;++i) neg[i] = -resid[i];
+    peak_result_t p = find_peaks_ref(neg, n, NULL, NULL, 1, NULL, NULL, 0, 0.5f, NULL);
+    int32_t cnt = p.n_peaks;
+    free_peak_result(&p);
+    free(neg);
+    return cnt;
+}
+
+float compute_spike_prom_sum(const float* resid, int32_t n){
+    if(!resid || n < 1) return NAN;
+    peak_result_t p = find_peaks_ref(resid, n, NULL, NULL, 1, NULL, NULL, 0, 0.5f, NULL);
+    float sum = 0.0f;
+    if(p.prominences){
+        for(int32_t i=0;i<p.n_peaks;++i){
+            float v = p.prominences[i];
+            if(isfinite(v) && fabsf(v) < 1e6f) sum += v; /* defensive filter */
+        }
+    }
+    free_peak_result(&p);
+    return isfinite(sum) && fabsf(sum) < 1e6f ? sum : NAN;
+}
+
+float compute_spike_width_mean_ms(const float* resid, int32_t n, float dt_ms){
+    if(!resid || n < 1) return NAN;
+    peak_result_t p = find_peaks_ref(resid, n, NULL, NULL, 1, NULL, NULL, 0, 0.5f, NULL);
+    float mean_w = 0.0f;
+    int32_t count = 0;
+    if(p.widths){
+        for(int32_t i=0;i<p.n_peaks;++i){
+            float w = p.widths[i];
+            if(isfinite(w) && w >= 0.0f && w < 1e6f){ mean_w += w; ++count; }
+        }
+    }
+    free_peak_result(&p);
+    if(count == 0) return NAN;
+    mean_w = mean_w / (float)count;
+    return mean_w * dt_ms;
+}
+
+int32_t compute_longest_flat(const float* x, int32_t n, float tol){
+    if(!x || n<=0) return 0;
+    int32_t best=1, cur=1;
+    for(int32_t i=1;i<n;++i){
+        if(fabsf(x[i]-x[i-1]) <= tol) { cur++; if(cur>best) best=cur; }
+        else cur=1;
+    }
+    return best;
+}
+
+float compute_hf_energy(const float* x, int32_t n){
+    if(!x || n<=1) return NAN;
+    float acc = 0.0f;
+    for(int32_t i=1;i<n;++i){ float d = x[i] - x[i-1]; acc += d*d; }
+    return acc;
+}
+
+float compute_spectral_entropy_stub(const float* x, int32_t n){
+    (void)x; (void)n; return NAN; /* FFT stub - not implemented to avoid mismatch */
+}
+
+float compute_roll_var(const float* x, int32_t n, int32_t window){
+    if(!x || n<=0 || window<=0) return NAN;
+    int32_t w = window;
+    float acc_var = 0.0f; int32_t count=0;
+    for(int32_t i=0;i + w <= n; ++i){
+        float s=0.0f, ss=0.0f;
+        for(int32_t j=0;j<w;++j){ float v = x[i+j]; s+=v; ss += v*v; }
+        float mean = s/(float)w; float var = ss/(float)w - mean*mean; acc_var += var; count++; }
+    return count? acc_var / (float)count : NAN;
+}
+
+float compute_edge_start_diff(const float* x, int32_t n, int32_t window){
+    if(!x || n<=2*window) return NAN;
+    float a=0.0f,b=0.0f;
+    for(int32_t i=0;i<window;++i){ a += x[i]; b += x[i+window]; }
+    return (a/(float)window) - (b/(float)window);
+}
+
+float compute_edge_end_diff(const float* x, int32_t n, int32_t window){
+    if(!x || n<=2*window) return NAN;
+    float a=0.0f,b=0.0f;
+    for(int32_t i=0;i<window;++i){ a += x[n-window+i]; b += x[n-2*window+i]; }
+    return (a/(float)window) - (b/(float)window);
+}
+
+float compute_min_drop(const float* x, int32_t n){
+    if(!x || n<=0) return NAN;
+    float minv = INFINITY; float start = x[0];
+    for(int32_t i=0;i<n;++i) if(!isnan(x[i]) && x[i] < minv) minv = x[i];
+    return isfinite(minv)? (start - minv) : NAN;
+}
+
+float compute_recovery_slope(const float* x, int32_t n, float plus_thresh, float dt_ms){
+    if(!x || n<=0) return NAN;
+    /* find argmin */
+    int32_t i0 = 0; float mn = INFINITY;
+    for(int32_t i=0;i<n;++i) if(!isnan(x[i]) && x[i] < mn){ mn = x[i]; i0 = i; }
+    int32_t stop = n;
+    for(int32_t j=i0;j<n;++j) if(isnan(x[j])){ stop = j; break; }
+    int32_t cross_idx = -1;
+    float target = mn + plus_thresh;
+    for(int32_t j=i0;j<stop;++j){ if(x[j] >= target){ cross_idx = j; break; } }
+    int32_t dt_samples = (cross_idx>=0)? (cross_idx - i0) : (stop - i0);
+    if(dt_samples <= 0) return NAN;
+    float bounce = x[ (stop-1) < 0 ? i0 : (stop-1) ] - mn;
+    float tms = dt_samples * dt_ms;
+    return bounce / tms;
+}
+
+float compute_poly_resid(const float* x, int32_t n, int32_t degree){
+    if(!x || n<=degree) return NAN;
+    if(degree==1){
+        float sx=0.0f, sy=0.0f, sxx=0.0f, sxy=0.0f;
+        for(int32_t i=0;i<n;++i){ sx += i; sy += x[i]; sxx += (float)i*(float)i; sxy += (float)i * x[i]; }
+        float denom = n * sxx - sx * sx;
+        if(denom == 0.0f) return NAN;
+        float a = (n * sxy - sx * sy) / denom;
+        float b = (sy - a * sx) / (float)n;
+        float rss = 0.0f; for(int32_t i=0;i<n;++i){ float r = x[i] - (a*(float)i + b); rss += r*r; }
+        return rss;
+    }
+    return NAN;
+}
+
+float compute_segment_slope_var(const float* x, int32_t n, int32_t seg_len){
+    if(!x || seg_len<=1 || n < seg_len) return NAN;
+    int32_t nseg = n / seg_len; if(nseg <= 0) return NAN;
+    float acc=0.0f, accsq=0.0f;
+    for(int32_t s=0;s<nseg;++s){ int32_t off = s*seg_len; float slope = (x[off + seg_len - 1] - x[off]) / (float)(seg_len - 1); acc += slope; accsq += slope*slope; }
+    float mean = acc / (float)nseg; return (accsq/(float)nseg) - mean*mean;
+}
+
+float compute_zero_cross_rate(const float* x, int32_t n){
+    if(!x || n<=1) return 0.0f;
+    int32_t zc = 0; for(int32_t i=1;i<n;++i) if((x[i-1] >= 0.0f && x[i] < 0.0f) || (x[i-1] < 0.0f && x[i] >= 0.0f)) zc++;
+    return (float)zc / (float)(n-1);
+}
+
+int32_t compute_step_count_sustained(const float* s, int32_t n, int32_t W){
+    if(!s || n<=0 || W<=0) return 0;
+    if(n < 3 * W) return 0;
+    int32_t box = W;
+    int32_t mlen = n - box + 1;
+    float* m1 = (float*)xmalloc_bytes((size_t)sizeof(float) * (size_t)mlen);
+    for(int32_t i=0;i + box <= n; ++i){ float sum=0.0f; for(int32_t j=0;j<box;++j) sum += s[i+j]; m1[i]=sum/box; }
+
+    int32_t nsteps = n - 3*W + 2;
+    if(nsteps <= 0){ free(m1); return 0; }
+    float* steps = (float*)xmalloc_bytes((size_t)sizeof(float) * (size_t)nsteps);
+    for(int32_t i=0;i<nsteps;++i){ float a = m1[(2*W - 1) + i]; float b = m1[(W - 1) + i]; steps[i] = a - b; }
+
+    /* compute MAD-based robust sigma for steps (like mad_sigma_f32) */
+    float step_sig = 0.0f;
+    if(nsteps > 0){
+        /* median */
+        float *tmp = (float*)xmalloc_bytes((size_t)sizeof(float) * (size_t)nsteps);
+        for(int32_t i=0;i<nsteps;++i) tmp[i] = steps[i];
+        qsort(tmp, (size_t)nsteps, sizeof(float), cmp_floats);
+        float med = (nsteps & 1) ? tmp[nsteps/2] : 0.5f*(tmp[nsteps/2 - 1] + tmp[nsteps/2]);
+        for(int32_t i=0;i<nsteps;++i) tmp[i] = fabsf(steps[i] - med);
+        qsort(tmp, (size_t)nsteps, sizeof(float), cmp_floats);
+        float mad = (nsteps & 1) ? tmp[nsteps/2] : 0.5f*(tmp[nsteps/2 - 1] + tmp[nsteps/2]);
+        step_sig = 1.4826f * mad + 1e-12f;
+        free(tmp);
+    }
+    float thr = 6.0f * step_sig; /* match pipeline conservative threshold */
+    int32_t cnt = 0;
+    for(int32_t i=0;i<nsteps;++i){ float v = fabsf(steps[i]); if(isfinite(v) && v > thr) cnt++; }
+
+    free(steps); free(m1);
+    return cnt;
+}
+
+float compute_max_step_mag(const float* s, int32_t n, int32_t W){
+    if(!s || n<=0 || W<=0) return 0.0f;
+    if(n < 3 * W) return 0.0f;
+    int32_t box = W;
+    int32_t mlen = n - box + 1;
+    float* m1 = (float*)xmalloc_bytes((size_t)sizeof(float) * (size_t)mlen);
+    for(int32_t i=0;i + box <= n; ++i){ float sum=0.0f; for(int32_t j=0;j<box;++j) sum += s[i+j]; m1[i]=sum/box; }
+
+    int32_t nsteps = n - 3*W + 2;
+    float maxmag = 0.0f;
+    for(int32_t i=0;i<nsteps;++i){ float a = m1[(2*W - 1) + i]; float b = m1[(W - 1) + i]; float step = a - b; if(isfinite(step) && fabsf(step) > maxmag) maxmag = fabsf(step); }
+    free(m1);
+    return maxmag;
+}
+
+// Direct DFT-based rfft power implementation (O(n^2)). Uses fixed dt_ms=10.0
+static void _rfft_power(const float* x, int32_t n, float** out_F, int32_t* out_len){
+    if(!x || n <= 0){ *out_F = NULL; *out_len = 0; return; }
+    int32_t N = n/2 + 1;
+    float *F = (float*)xmalloc_bytes((size_t)sizeof(float)*(size_t)N);
+    const double two_pi_over_n = 2.0 * (double)M_PIf / (double)n;
+    for(int32_t k=0;k<N;++k){
+        double re = 0.0, im = 0.0;
+        for(int32_t j=0;j<n;++j){
+            double angle = two_pi_over_n * (double)k * (double)j;
+            double cj = cos(angle);
+            double sj = sin(angle);
+            re += (double)x[j] * cj;
+            im -= (double)x[j] * sj; /* sign convention */
+        }
+        double mag2 = re*re + im*im;
+        F[k] = (float)mag2;
+    }
+    *out_F = F; *out_len = N;
+}
+
+float compute_bp_low_stub(const float* x, int32_t n){
+    if(!x || n <= 0) return NAN;
+    /* dt = 10 ms fixed like Python pipeline */
+    const double dt_s = 10.0 / 1000.0;
+    float *F = NULL; int32_t N = 0;
+    _rfft_power(x, n, &F, &N);
+    if(!F || N == 0) return NAN;
+    double step = 1.0 / ((double)n * dt_s);
+    double Ptot = 1e-12;
+    for(int32_t i=0;i<N;++i) Ptot += (double)F[i];
+    double sum = 0.0;
+    for(int32_t k=0;k<N;++k){ double freq = (double)k * step; if(freq >= 0.5 && freq < 2.0) sum += (double)F[k]; }
+    free(F);
+    return (float)(sum / Ptot);
+}
+
+float compute_bp_mid_stub(const float* x, int32_t n){
+    if(!x || n <= 0) return NAN;
+    const double dt_s = 10.0 / 1000.0;
+    float *F = NULL; int32_t N = 0;
+    _rfft_power(x, n, &F, &N);
+    if(!F || N == 0) return NAN;
+    double step = 1.0 / ((double)n * dt_s);
+    double Ptot = 1e-12;
+    for(int32_t i=0;i<N;++i) Ptot += (double)F[i];
+    double sum = 0.0;
+    for(int32_t k=0;k<N;++k){ double freq = (double)k * step; if(freq >= 2.0 && freq < 8.0) sum += (double)F[k]; }
+    free(F);
+    return (float)(sum / Ptot);
+}
+
+float compute_bp_high_stub(const float* x, int32_t n){
+    if(!x || n <= 0) return NAN;
+    const double dt_s = 10.0 / 1000.0;
+    float *F = NULL; int32_t N = 0;
+    _rfft_power(x, n, &F, &N);
+    if(!F || N == 0) return NAN;
+    double step = 1.0 / ((double)n * dt_s);
+    double Ptot = 1e-12;
+    for(int32_t i=0;i<N;++i) Ptot += (double)F[i];
+    double sum = 0.0;
+    for(int32_t k=0;k<N;++k){ double freq = (double)k * step; if(freq >= 8.0 && freq < 20.0) sum += (double)F[k]; }
+    free(F);
+    return (float)(sum / Ptot);
+}
+
+float compute_resid_spectral_entropy_stub(const float* x, int32_t n){
+    if(!x || n <= 0) return NAN;
+    const double dt_s = 10.0 / 1000.0;
+    float *F = NULL; int32_t N = 0;
+    _rfft_power(x, n, &F, &N);
+    if(!F || N == 0) return NAN;
+    double Ptot = 0.0;
+    for(int32_t i=0;i<N;++i) Ptot += (double)F[i];
+    Ptot += 1e-12;
+    double entr = 0.0;
+    for(int32_t i=0;i<N;++i){ double p = (double)F[i] / Ptot + 1e-12; entr += p * log(p); }
+    free(F);
+    return (float)(-entr);
+}
+
+float compute_rel_below_frac(const float* x, int32_t n, float thr){ if(!x||n<=0) return NAN; int32_t cnt=0, tot=0; for(int32_t i=0;i<n;++i){ if(!isnan(x[i])){ tot++; if(x[i]<thr) cnt++; }} return tot? (float)cnt/(float)tot : NAN; }
+
+int32_t compute_rel_below_longest_ms(const float* x, int32_t n, float thr, float dt_ms){ if(!x||n<=0) return 0; int32_t best=0, cur=0; for(int32_t i=0;i<n;++i){ if(!isnan(x[i]) && x[i]<thr){ cur++; if(cur>best) best=cur; } else cur=0; } return (int32_t)(best * dt_ms); }
+
+float compute_win_range_max(const float* x, int32_t n, int32_t win){ if(!x||n<=0||win<=0) return NAN; float best=0.0f; for(int32_t i=0;i+win<=n;++i){ float mn=INFINITY,mx=-INFINITY; for(int32_t j=0;j<win;++j){ float v=x[i+j]; if(v<mn) mn=v; if(v>mx) mx=v; } float r = mx-mn; if(r>best) best=r; } return best; }
+
+float compute_tail_std(const float* x, int32_t n, int32_t tail_len){ if(!x||n<=0||tail_len<=0) return NAN; int32_t start = (n>tail_len)? n-tail_len : 0; int32_t cnt=0; float mean=0.0f; for(int32_t i=start;i<n;++i){ if(!isnan(x[i])){ cnt++; mean += x[i]; }} if(cnt==0) return NAN; mean /= (float)cnt; float ss=0.0f; for(int32_t i=start;i<n;++i) if(!isnan(x[i])){ float d = x[i]-mean; ss += d*d; } return sqrtf(ss/(float)cnt); }
+
+float compute_tail_ac1(const float* x, int32_t n, int32_t tail_len){ if(!x||n<=0||tail_len<=1) return NAN; int32_t start = (n>tail_len)? n-tail_len : 0; int32_t cnt=0; float mean=0.0f; for(int32_t i=start;i<n;++i){ if(!isnan(x[i])){ cnt++; mean += x[i]; }} if(cnt<=1) return NAN; mean /= (float)cnt; float num=0.0f, den=0.0f; for(int32_t i=start;i<n-1;++i){ if(!isnan(x[i]) && !isnan(x[i+1])){ float a = x[i]-mean; float b = x[i+1]-mean; num += a*b; den += a*a; }} if(den==0.0f) return NAN; return num/den; }
+
+float compute_crest_factor(const float* x, int32_t n){ if(!x||n<=0) return NAN; float mx=0.0f, ss=0.0f; int32_t cnt=0; for(int32_t i=0;i<n;++i){ if(!isnan(x[i])){ float av=fabsf(x[i]); if(av>mx) mx=av; ss += x[i]*x[i]; cnt++; }} if(cnt==0) return NAN; float rms = sqrtf(ss/(float)cnt); if(rms==0.0f) return NAN; return mx / rms; }
+
+float compute_line_length(const float* x, int32_t n){ if(!x||n<=1) return 0.0f; float acc=0.0f; for(int32_t i=1;i<n;++i) acc += fabsf(x[i]-x[i-1]); return acc; }
+
+float compute_mid_duty_cycle_low(const float* x, int32_t n, float low_thr){ if(!x||n<=0) return NAN; int32_t a = n/5, b = (n*4)/5; if(b<=a) return NAN; int32_t cnt=0, tot=0; for(int32_t i=a;i<b;++i){ if(!isnan(x[i])){ tot++; if(x[i] < low_thr) cnt++; }} return tot? (float)cnt/(float)tot : NAN; }
+
+

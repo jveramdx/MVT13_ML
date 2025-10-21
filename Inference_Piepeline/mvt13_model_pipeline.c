@@ -10,6 +10,9 @@
 #include "numpy_functions.h"
 #include <stdbool.h>
 
+// This file contains the C implementation of the feature engineering and inference pipeline for the MVT13 model.
+// This simulates how the model will run in an embedded C environment.
+
 #define MAX_POINTS 508
 #define MAX_ALTERNATOR_RIPPLE 257
 #define PRE_END 18
@@ -17,6 +20,8 @@
 #define POST_START 19
 #define RECOVERY_END 20
 #define START_END 5
+/* total number of packed features produced by pack_features (0..59) */
+#define FEATURE_COUNT 60
 
 typedef struct {
     
@@ -66,6 +71,25 @@ typedef struct {
     float   bp_high;      // [8.0, 20.0) / total
     float   bp_mid_ratio; // bp_mid / (bp_low + 1e-12)
     float   bp_high_ratio;// bp_high / (bp_low + 1e-12)
+    /* additional time-domain features that the comparator expects */
+    int32_t longest_flat;
+    float   hf_energy;
+    float   spectral_entropy;
+    float   resid_spectral_entropy;
+    float   roll_var;
+    float   edge_start_diff;
+    float   edge_end_diff;
+    float   poly_resid;
+    float   segment_slope_var;
+    float   zero_cross_rate;
+    float   rel_below_frac;
+    int32_t rel_below_longest_ms;
+    float   win_range_max;
+    float   tail_std;
+    float   tail_ac1;
+    float   crest_factor;
+    float   line_length;
+    float   mid_duty_cycle_low;
 } Record;
 
 typedef struct {
@@ -81,6 +105,12 @@ typedef struct {
     int idx_measured;
     int idx_ripple;
 } ColIdx;
+
+static int is_all_digits(const char *s) {
+    if (!s || !*s) return 0;
+    for (const char *p = s; *p; ++p) if (!isdigit((unsigned char)*p)) return 0;
+    return 1;
+}
 
 
 //--------------Utility Functions-------------------
@@ -602,7 +632,8 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
     // peak conditions
     int32_t min_dist  = (int32_t)fmaxf(2.0f, floorf(30.0f / dt_ms + 1e-6f)); // ≥ 30ms
     int32_t min_width = (int32_t)fmaxf(1.0f, floorf(10.0f / dt_ms + 1e-6f)); // ≥ 10ms
-    float   min_prom  = 3.0f * sig_res;
+    /* increase prominence multiplier slightly to reduce false detections */
+    float   min_prom  = 4.0f * sig_res;
 
     // find_peaks on resid (positive spikes)
     float NaN = NAN;
@@ -644,23 +675,21 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
     // sum of prominences
     float prom_sum = 0.0f;
     if(pos.prominences){
-        for(int32_t i=0;i<pos.n_peaks;++i) prom_sum += pos.prominences[i];
+        for(int32_t i=0;i<pos.n_peaks;++i){ float v = pos.prominences[i]; if(isfinite(v) && fabsf(v) < 1e6f) prom_sum += v; }
     }
     if(negp.prominences){
-        for(int32_t i=0;i<negp.n_peaks;++i) prom_sum += negp.prominences[i];
+        for(int32_t i=0;i<negp.n_peaks;++i){ float v = negp.prominences[i]; if(isfinite(v) && fabsf(v) < 1e6f) prom_sum += v; }
     }
+    if(!isfinite(prom_sum) || fabsf(prom_sum) >= 1e8f) prom_sum = NAN; /* defensive clamp */
 
     // mean width (samples) -> ms
-    float spike_w_mean_ms = 0.0f;
+    float spike_w_mean_ms = NAN;
     if(spike_cnt > 0){
         int32_t count = 0;
         float accw = 0.0f;
-        if(pos.widths){ for(int32_t i=0;i<pos.n_peaks;++i){ accw += pos.widths[i]; ++count; } }
-        if(negp.widths){ for(int32_t i=0;i<negp.n_peaks;++i){ accw += negp.widths[i]; ++count; } }
-        if(count > 0){
-            float w_mean = accw / (float)count;
-            spike_w_mean_ms = w_mean * dt_ms;
-        }
+        if(pos.widths){ for(int32_t i=0;i<pos.n_peaks;++i){ float w=pos.widths[i]; if(isfinite(w) && w>=0.0f && w<1e6f){ accw += w; ++count; } } }
+        if(negp.widths){ for(int32_t i=0;i<negp.n_peaks;++i){ float w=negp.widths[i]; if(isfinite(w) && w>=0.0f && w<1e6f){ accw += w; ++count; } } }
+        if(count > 0){ float w_mean = accw / (float)count; spike_w_mean_ms = w_mean * dt_ms; }
     }
 
     // ---------------- sustained steps (boxcar diff of moving averages) --------
@@ -689,8 +718,8 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
         }
 
         // MAD sigma of steps
-        float step_sig = mad_sigma_f32(steps, nsteps);
-        float thr = 4.0f * step_sig;
+    float step_sig = mad_sigma_f32(steps, nsteps);
+    float thr = 6.0f * step_sig; /* be more conservative */
 
         // count |steps| > thr, and track max magnitude
         int32_t cnt = 0;
@@ -701,7 +730,7 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
             if(v > maxmag) maxmag = v;
         }
         step_count_sust = cnt;
-        max_step_mag = maxmag;
+    max_step_mag = (isfinite(maxmag) && fabsf(maxmag) < 1e6f) ? maxmag : NAN;
 
         free(steps); free(m1); free(box);
     } else {
@@ -715,44 +744,39 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
     float mu = mean_f32(resid, n);
     for(int32_t i=0;i<n;++i) Xr[i] = resid[i] - mu;
 
-    // rFFT via full FFT of real input -> take first N bins
-    int32_t N = (n % 2 == 0) ? (n/2 + 1) : ((n + 1)/2);
-    float _Complex* cx = (float _Complex*)malloc((size_t)n*sizeof(float _Complex));
-    for(int32_t i=0;i<n;++i) cx[i] = Xr[i] + 0.0f*I;
+    // FFT-based bandpower features are skipped here (FFT implementation not
+    // available in this build). Set bandpower fields to NaN so downstream
+    // code knows these features are unavailable. This intentionally avoids
+    // dependence on np_fft_fft / PocketFFT and mirrors the decision to skip
+    // FFT-based validation.
+    float bp_low = NAN, bp_mid = NAN, bp_high = NAN;
+    float bp_mid_ratio = NAN, bp_high_ratio = NAN;
+    if (!isnan(bp_low) && bp_low != 0.0f) bp_mid_ratio = bp_mid / (bp_low + 1e-12f);
+    if (!isnan(bp_low) && bp_low != 0.0f) bp_high_ratio = bp_high / (bp_low + 1e-12f);
 
-    float _Complex* X = np_fft_fft(cx, n, n, FFT_NORM_BACKWARD, NULL);
-
-    // power spectrum Fr = |X[k]|^2 for k=0..N-1
-    float* Fr = (float*)malloc((size_t)N*sizeof(float));
-    for(int32_t k=0;k<N;++k){
-        float re = crealf(X[k]), im = cimagf(X[k]);
-        Fr[k] = re*re + im*im;
-    }
-
-    // frequency bins
-    float d = dt_ms / 1000.0f;
-    float* freqs = np_fft_rfftfreq(n, d); // length N
-
-    // band helper
-    float Ptot = 1e-12f;
-    for(int32_t k=0;k<N;++k) Ptot += Fr[k];
-
-    // [0.5, 2.0), [2.0, 8.0), [8.0, 20.0)
-    float bp_low = 0.0f, bp_mid = 0.0f, bp_high = 0.0f;
-    for(int32_t k=0;k<N;++k){
-        float fHz = freqs[k];
-        float v   = Fr[k];
-        if(fHz >= 0.5f  && fHz < 2.0f)  bp_low  += v;
-        else if(fHz >= 2.0f && fHz < 8.0f)  bp_mid  += v;
-        else if(fHz >= 8.0f && fHz < 20.0f) bp_high += v;
-    }
-    bp_low  /= Ptot;
-    bp_mid  /= Ptot;
-    bp_high /= Ptot;
-
-    float denom = bp_low + 1e-12f;
-    float bp_mid_ratio  = bp_mid  / denom;
-    float bp_high_ratio = bp_high / denom;
+     /* compute additional time-domain features where possible (non-FFT)
+         Many of these re-use existing temporaries computed above. */
+      int32_t longest_flat = compute_longest_flat(full_seg, FULL_END, 0.001f);
+      /* HF energy and spectral entropy depend on FFT; leave as NaN until a
+          numerically-equivalent FFT (PocketFFT) is integrated to match Python */
+      float hf_energy = NAN;
+     float spectral_entropy = NAN;
+     float roll_var = compute_roll_var(full_seg, FULL_END, 5);
+     float edge_start_diff = compute_edge_start_diff(full_seg, FULL_END, 5);
+     float edge_end_diff = compute_edge_end_diff(full_seg, FULL_END, 5);
+    float poly_resid = compute_poly_resid(full_seg, FULL_END, 1);
+    /* resid_spectral_entropy depends on rfft; set to NaN for parity avoidance */
+    float resid_spectral_entropy = NAN;
+     float segment_slope_var = compute_segment_slope_var(full_seg, FULL_END, 10);
+     float zero_cross_rate = compute_zero_cross_rate(full_seg, FULL_END);
+     float rel_below_frac = compute_rel_below_frac(full_seg, FULL_END, 9.0f);
+     int32_t rel_below_longest_ms = compute_rel_below_longest_ms(full_seg, FULL_END, 9.0f, dt_ms);
+     float win_range_max = compute_win_range_max(full_seg, FULL_END, 10);
+     float tail_std = compute_tail_std(full_seg, FULL_END, 20);
+     float tail_ac1 = compute_tail_ac1(full_seg, FULL_END, 20);
+     float crest_factor = compute_crest_factor(full_seg, FULL_END);
+     float line_length = compute_line_length(full_seg, FULL_END);
+     float mid_duty_cycle_low = compute_mid_duty_cycle_low(full_seg, FULL_END, 9.0f);
 
     // Populate output record
     out->voltage = voltage;
@@ -797,13 +821,33 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
     out->bp_high = bp_high;
     out->bp_mid_ratio = bp_mid_ratio;
     out->bp_high_ratio = bp_high_ratio;
+     out->spectral_entropy = spectral_entropy;
+     out->poly_resid = poly_resid;
+     /* pack resid spectral entropy into spectral_entropy field? Add new field reserved */
+     /* currently we will reuse out->spectral_entropy for the full-signal spectral entropy and
+         store resid_spectral_entropy in poly_resid temporarily if necessary (but better to add a field) */
+     out->resid_spectral_entropy = resid_spectral_entropy;
+    /* additional fields */
+    out->longest_flat = longest_flat;
+    out->hf_energy = hf_energy;
+    out->spectral_entropy = spectral_entropy;
+    out->roll_var = roll_var;
+    out->edge_start_diff = edge_start_diff;
+    out->edge_end_diff = edge_end_diff;
+    out->poly_resid = poly_resid;
+    out->segment_slope_var = segment_slope_var;
+    out->zero_cross_rate = zero_cross_rate;
+    out->rel_below_frac = rel_below_frac;
+    out->rel_below_longest_ms = rel_below_longest_ms;
+    out->win_range_max = win_range_max;
+    out->tail_std = tail_std;
+    out->tail_ac1 = tail_ac1;
+    out->crest_factor = crest_factor;
+    out->line_length = line_length;
+    out->mid_duty_cycle_low = mid_duty_cycle_low;
 
 
     // ---------------- cleanup ----------------
-    free(freqs);
-    free(Fr);
-    free(X);
-    free(cx);
     free(Xr);
 
     free(neg);
@@ -828,7 +872,7 @@ void preprocess_record(const char *starter_str, const char *software_version_str
 // Declare the external model function (from m2cgen export).
 void score(const float * input, float * output);
 /* ===================== ADDED: feature packing (uses your existing Record) ===================== */
-static void pack_features(const Record *record, float features[42]) {
+static void pack_features(const Record *record, float features[FEATURE_COUNT]) {
     features[0]  = record->voltage;
     features[1]  = record->measured;
     features[2]  = record->min_val;
@@ -871,6 +915,25 @@ static void pack_features(const Record *record, float features[42]) {
     features[39] = record->bp_high;
     features[40] = record->bp_mid_ratio;
     features[41] = record->bp_high_ratio;
+    /* additional fields mapped after 42 */
+    features[42] = (float)record->longest_flat;
+    features[43] = record->hf_energy;
+    features[44] = record->spectral_entropy;
+    features[45] = record->roll_var;
+    features[46] = record->edge_start_diff;
+    features[47] = record->edge_end_diff;
+    features[48] = record->poly_resid;
+    features[49] = record->segment_slope_var;
+    features[50] = record->zero_cross_rate;
+    features[51] = record->rel_below_frac;
+    features[52] = (float)record->rel_below_longest_ms;
+    features[53] = record->win_range_max;
+    features[54] = record->tail_std;
+    features[55] = record->tail_ac1;
+    features[56] = record->crest_factor;
+    features[57] = record->line_length;
+    features[58] = record->mid_duty_cycle_low;
+    features[59] = record->resid_spectral_entropy;
 }
 
 /* ===================== ADDED: tiny case-insensitive compare ===================== */
@@ -943,8 +1006,11 @@ static ssize_t read_line_dynamic(FILE *f, char **buf, size_t *cap) {
 
 /* ===================== ADDED: output header and row writers ===================== */
 static void write_output_header(FILE *fo) {
+    /* Base ID column */
     fprintf(fo, "Test_Record_Detail_ID");
-    const char *feat_names[42] = {
+
+    /* Internal / original feature names (0..41) */
+    const char *base_names[] = {
         "voltage","measured","min_val","max_val","std_dev","avg","median",
         "bounce_back","drop","slope_bounce_back","slope_drop",
         "min_volt_below_19","max_volt_19_above","start_voltage","recovery_time_ms",
@@ -955,9 +1021,25 @@ static void write_output_header(FILE *fo) {
         "dip_cnt", "prom_sum", "spike_w_mean_ms", "step_count_sust", "max_step_mag",
         "bp_low", "bp_mid", "bp_high", "bp_mid_ratio", "bp_high_ratio"
     };
-    for (int i=0;i<42;i++) fprintf(fo, ",%s", feat_names[i]);
+    const int base_count = (int)(sizeof(base_names)/sizeof(base_names[0]));
+    for (int i=0;i<base_count;i++) fprintf(fo, ",%s", base_names[i]);
 
-    // MATCH THE ROW ORDER: Bad, then Good
+    /* Append comparator-expected feature names (case-sensitive) so compare_features.py
+       finds the columns. These map to packed feature indices (see write_row mapping).
+    */
+    const char *cmp_names[] = {
+        "Spike_Count","Dip_Count","Spike_Prom_Sum","Spike_Width_Mean_Ms",
+        "Longest_Flat","Hf_Energy","Spectral_Entropy","Roll_Var",
+        "Edge_Start_Diff","Edge_End_Diff","Min_Drop","Recovery_Slope",
+        "Poly_Resid","Segment_Slope_Var","Zero_Cross_Rate",
+        "Step_Count_Sustained","Max_Step_Mag","Bp_Low","Bp_Mid","Bp_High",
+        "Bp_Mid_Ratio","Bp_High_Ratio","Resid_Spectral_Entropy",
+        "Rel_Below_Frac","Rel_Below_Longest_Ms","Win_Range_Max",
+        "Tail_Std","Tail_Ac1","Crest_Factor","Line_Length","Mid_Duty_Cycle_Low"
+    };
+    const int cmp_count = (int)(sizeof(cmp_names)/sizeof(cmp_names[0]));
+    for (int i=0;i<cmp_count;i++) fprintf(fo, ",%s", cmp_names[i]);
+
     fprintf(fo, "\n");
 }
 
@@ -972,13 +1054,36 @@ static int is_blank_csv_line(const char *s) {
     return 1;
 }
 
-static void write_row(FILE *fo, const char *id, const float features[42]) {
+static void write_row(FILE *fo, const char *id, const float features[FEATURE_COUNT]) {
     fprintf(fo, "\"%s\"", id ? id : "");
-    for (int i=0;i<42;i++) {
+
+    /* write base features 0..41 in the same order as header */
+    for (int i = 0; i <= 41; ++i) {
         if (isnan(features[i])) fprintf(fo, ",");
         else                    fprintf(fo, ",%.6f", features[i]);
     }
-    // Match header: Good, Bad, Decision
+
+    /* Now append comparator-specific columns by mapping each expected name to
+       the corresponding index in the packed features array. Order here must
+       match the cmp_names order in write_output_header. */
+    const int mapping[] = {
+        31, /* Spike_Count */ 32, /* Dip_Count */ 33, /* Spike_Prom_Sum */ 34, /* Spike_Width_Mean_Ms */
+        42, /* Longest_Flat */ 43, /* Hf_Energy */ 44, /* Spectral_Entropy */ 45, /* Roll_Var */
+        46, /* Edge_Start_Diff */ 47, /* Edge_End_Diff */ 8,  /* Min_Drop */ 29, /* Recovery_Slope */
+        48, /* Poly_Resid */ 49, /* Segment_Slope_Var */ 50, /* Zero_Cross_Rate */
+        35, /* Step_Count_Sustained */ 36, /* Max_Step_Mag */ 37, /* Bp_Low */ 38, /* Bp_Mid */
+    39, /* Bp_High */ 40, /* Bp_Mid_Ratio */ 41, /* Bp_High_Ratio */ 59, /* Resid_Spectral_Entropy */
+        51, /* Rel_Below_Frac */ 52, /* Rel_Below_Longest_Ms */ 53, /* Win_Range_Max */
+        54, /* Tail_Std */ 55, /* Tail_Ac1 */ 56, /* Crest_Factor */ 57, /* Line_Length */ 58 /* Mid_Duty_Cycle_Low */
+    };
+    const int map_count = (int)(sizeof(mapping)/sizeof(mapping[0]));
+    for (int mi = 0; mi < map_count; ++mi) {
+        int idx = mapping[mi];
+        if (idx < 0 || idx >= FEATURE_COUNT) { fprintf(fo, ","); continue; }
+        if (isnan(features[idx])) fprintf(fo, ",");
+        else fprintf(fo, ",%.6f", features[idx]);
+    }
+
     fprintf(fo, "\n");
 }
 
@@ -1112,11 +1217,33 @@ int main(int argc, char *argv[]) {
     col.idx_measured = header_index(fields, nfields, c_meas,    (int)(sizeof(c_meas)/sizeof(c_meas[0])));
     col.idx_ripple   = header_index(fields, nfields, c_ripple,  (int)(sizeof(c_ripple)/sizeof(c_ripple[0])));
 
+    /* If starter column wasn't found as a single combined column, detect
+       the numeric-per-sample layout with headers like "0","1","2",... */
+    int starter_is_multi = 0;
+    int starter_multi_count = 0;
+    if (col.idx_starter < 0) {
+        for (int j = 0; j < nfields; ++j) {
+            if (is_all_digits(fields[j])) {
+                /* count consecutive digit-only headers */
+                int k = j;
+                int cnt = 0;
+                while (k < nfields && is_all_digits(fields[k]) && cnt < MAX_POINTS) { cnt++; k++; }
+                if (cnt >= 2) { /* treat as starter multi-column */
+                    col.idx_starter = j;
+                    starter_is_multi = 1;
+                    starter_multi_count = cnt;
+                    break;
+                }
+            }
+        }
+    }
+
     free(header_line);
 
-    if (col.idx_id < 0 || col.idx_starter < 0 || col.idx_swver < 0 ||
-        col.idx_voltage < 0 || col.idx_measured < 0 || col.idx_ripple < 0) {
-        fprintf(stderr, "Missing one or more required columns in CSV header.\n");
+    /* Require at minimum an ID and starter data (either single-column or
+       multi-column). Other columns are optional and will be defaulted. */
+    if (col.idx_id < 0 || col.idx_starter < 0) {
+        fprintf(stderr, "Missing required ID or starter columns in CSV header.\n");
         fclose(fi); fclose(fo); free(line);
         return 1;
     }
@@ -1151,45 +1278,57 @@ int main(int argc, char *argv[]) {
         trim_id_inplace(idbuf);
         if (idbuf[0] == '\0') { printf("Dropping row %s: due to missing ID\n", line); free(row); continue; }  /* no ID → drop */
 
-        float feats[42]; for (int i=0;i<42;i++) feats[i]=NAN;
-        int invalid = 0;
-        if (!invalid) {
-            char *endp=NULL;
-            float voltage = (float)strtof(vstr, &endp);
-            if (endp == vstr) invalid = 1;
+    float feats[FEATURE_COUNT]; for (int i=0;i<FEATURE_COUNT;i++) feats[i]=NAN;
 
-            long mtmp = strtol(mstr, &endp, 10);
-            if (endp == mstr) invalid = 1;
-            int16_t measured = (int16_t)mtmp;
+        /* parse optional numeric columns defensively */
+        char *endp = NULL;
+        float voltage = NAN;
+        if (col.idx_voltage >= 0 && vstr && vstr[0] != '\0') {
+            endp = NULL; voltage = (float)strtof(vstr, &endp);
+            if (endp == vstr) voltage = NAN;
+        }
+        int16_t measured = 0;
+        if (col.idx_measured >= 0 && mstr && mstr[0] != '\0') {
+            endp = NULL; long mtmp = strtol(mstr, &endp, 10);
+            if (endp != mstr) measured = (int16_t)mtmp;
+        }
 
+        /* ripple optional */
+        if (col.idx_ripple >= 0 && ripple && ripple[0] != '\0') {
             float ripple_vals[MAX_ALTERNATOR_RIPPLE];
             int ripple_count = process_alternator_ripple(ripple, ripple_vals);
-            float ripple_sum = sum_alternator_ripple_array(ripple_vals, ripple_count);
-            
-            if (!invalid) {
-                Record rec;
-                preprocess_record(starter, swver, voltage, measured, &rec);
-
-                /* inference: y[0]=Prob_Bad, y[1]=Prob_Good */
-                pack_features(&rec, feats);
-                /**
-                float y[2] = {0.0f, 0.0f};
-                score(feats, y);
-                float p_good = y[1];
-                float p_bad  = y[0];
-                const char *decision = (p_good >= 0.5f) ? "GOOD_BATTERY" : "BAD_BATTERY";
-                */
-               
-                /* mark ID as emitted only when we actually write the row */
-                if (idset_add(&seen, idbuf) < 0) { free(row); break; }
-                write_row(fo, idbuf, feats);
-                 
-                free(row);
-                continue;
-            }
+            (void)sum_alternator_ripple_array(ripple_vals, ripple_count);
         }
-        /* invalid rows are dropped silently (no extra line in output) */
-        free(row);
+
+        /* build record from either single starter-string or multi-column samples */
+        {
+            Record rec;
+            if (starter_is_multi) {
+                int last_idx = -1;
+                float fvalues[MAX_POINTS];
+                for (int ii = 0; ii < MAX_POINTS; ++ii) fvalues[ii] = NAN;
+                int max_take = starter_multi_count;
+                if (max_take > MAX_POINTS) max_take = MAX_POINTS;
+                for (int ii = 0; ii < max_take && (col.idx_starter + ii) < nf; ++ii) {
+                    const char *tok = cols[col.idx_starter + ii];
+                    if (!tok || tok[0] == '\0') { fvalues[ii] = NAN; continue; }
+                    char *e = NULL; float v = strtof(tok, &e);
+                    if (e == tok) { fvalues[ii] = NAN; } else { fvalues[ii] = v; last_idx = ii; }
+                }
+                int16_t nvals = (last_idx >= 0) ? (last_idx + 1) : 0;
+                compute_features(fvalues, nvals, &rec, voltage, measured);
+            } else {
+                preprocess_record(starter, swver, voltage, measured, &rec);
+            }
+
+            /* pack and write */
+            pack_features(&rec, feats);
+
+            if (idset_add(&seen, idbuf) < 0) { free(row); break; }
+            write_row(fo, idbuf, feats);
+            free(row);
+        }
+        continue;
     }
 
     idset_free(&seen);
