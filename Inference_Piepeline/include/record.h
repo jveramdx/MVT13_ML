@@ -50,6 +50,29 @@ typedef struct {
     float   bp_high;       // [8.0, 20.0) / total
     float   bp_mid_ratio;  // bp_mid / (bp_low + 1e-12)
     float   bp_high_ratio; // bp_high / (bp_low + 1e-12)
+
+        // --- extras to match Python ---
+    float   longest_flat;
+    float   hf_energy;
+    float   spectral_entropy;
+    float   roll_var;
+    float   edge_start_diff;
+    float   edge_end_diff;
+    float   min_drop;
+    float   recovery_slope;
+    float   poly_resid;
+    float   segment_slope_var;
+    float   zero_cross_rate;
+    float   resid_spectral_entropy;
+    float   rel_below_frac;
+    float   rel_below_longest_ms;
+    float   win_range_max;
+    float   tail_std;
+    float   tail_ac1;
+    float   crest_factor;
+    float   line_length;
+    float   mid_duty_cycle_low;
+
 } Record;
 
 #endif // RECORD_H_

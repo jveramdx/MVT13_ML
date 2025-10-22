@@ -80,19 +80,22 @@ static void preprocess_record(const char *starter_str, const char *software_vers
 }
 
 // -------- feature packing (42) --------
-static void pack_features(const Record *r, float f[42]) {
+static void pack_features(const Record *r, float f[63]) {
     f[0]=r->voltage; f[1]=r->measured; f[2]=r->min_val; f[3]=r->max_val; f[4]=r->std_dev;
     f[5]=r->avg; f[6]=r->median; f[7]=r->bounce_back; f[8]=r->drop; f[9]=r->slope_bounce_back;
     f[10]=r->slope_drop; f[11]=r->min_volt_below_19; f[12]=r->max_volt_19_above; f[13]=r->start_voltage;
-    f[14]=r->recovery_time_ms; f[15]=r->area_0_200ms; f[16]=r->count_below7; f[17]=r->count_below9;
-    f[18]=r->count_below10; f[19]=r->curve_kurtosis; f[20]=r->curve_skew; f[21]=r->max_rise_rate_0_180;
-    f[22]=r->max_fall_rate_0_180; f[23]=r->mean_abs_slope_0_180; f[24]=r->std_slope_0_180;
-    f[25]=r->mean_abs_accel_0_180; f[26]=r->max_accel_0_180; f[27]=r->min_accel_0_180;
-    f[28]=r->norm_energy_200ms; f[29]=r->rec_slope; f[30]=r->r_est; f[31]=r->spike_cnt;
-    f[32]=r->dip_cnt; f[33]=r->prom_sum; f[34]=r->spike_w_mean_ms; f[35]=r->step_count_sust;
-    f[36]=r->max_step_mag; f[37]=r->bp_low; f[38]=r->bp_mid; f[39]=r->bp_high;
-    f[40]=r->bp_mid_ratio; f[41]=r->bp_high_ratio;
+    f[14]=r->time_to_min_ms; f[15]=r->recovery_time_ms; f[16]=r->area_0_200ms; f[17]=r->count_below7; f[18]=r->count_below9;
+    f[19]=r->count_below10; f[20]=r->curve_kurtosis; f[21]=r->curve_skew; f[22]=r->max_rise_rate_0_180; f[23]=r->max_fall_rate_0_180;
+    f[24]=r->mean_abs_slope_0_180; f[25]=r->std_slope_0_180; f[26]=r->mean_abs_accel_0_180; f[27]=r->max_accel_0_180; f[28]=r->min_accel_0_180;
+    f[29]=r->norm_energy_200ms; f[30]=r->rec_slope; f[31]=r->r_est; f[32]=r->spike_cnt; f[33]=r->dip_cnt;
+    f[34]=r->prom_sum; f[35]=r->spike_w_mean_ms; f[36]=r->longest_flat; f[37]=r->hf_energy; f[38]=r->spectral_entropy;
+    f[39]=r->roll_var; f[40]=r->edge_start_diff; f[41]=r->edge_end_diff; f[42]=r->min_drop; f[43]=r->recovery_slope;
+    f[44]=r->poly_resid; f[45]=r->segment_slope_var; f[46]=r->zero_cross_rate; f[47]=r->step_count_sust; f[48]=r->max_step_mag;
+    f[49]=r->bp_low; f[50]=r->bp_mid; f[51]=r->bp_high; f[52]=r->bp_mid_ratio; f[53]=r->bp_high_ratio;
+    f[54]=r->resid_spectral_entropy; f[55]=r->rel_below_frac; f[56]=r->rel_below_longest_ms; f[57]=r->win_range_max; f[58]=r->tail_std;
+    f[59]=r->tail_ac1; f[60]=r->crest_factor; f[61]=r->line_length; f[62]=r->mid_duty_cycle_low;
 }
+
 
 static int iequals(const char *a, const char *b) {
     for (; *a && *b; a++, b++) if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
@@ -140,16 +143,26 @@ static ssize_t read_line_dynamic(FILE *f, char **buf, size_t *cap) {
 }
 
 static void write_output_header(FILE *fo) {
-    static const char *feat_names[42] = {
-        "voltage","measured","min_val","max_val","std_dev","avg","median",
-        "bounce_back","drop","slope_bounce_back","slope_drop",
-        "min_volt_below_19","max_volt_19_above","start_voltage","recovery_time_ms",
-        "area_0_200ms","count_below7","count_below9","count_below10","curve_kurtosis",
-        "curve_skew","max_rise_rate_0_180","max_fall_rate_0_180","mean_abs_slope_0_180",
-        "std_slope_0_180","mean_abs_accel_0_180","max_accel_0_180","min_accel_0_180",
-        "norm_energy_200ms","rec_slope","r_est","spike_cnt","dip_cnt",
-        "prom_sum","spike_w_mean_ms","step_count_sust","max_step_mag",
-        "bp_low","bp_mid","bp_high","bp_mid_ratio","bp_high_ratio"
+    static const char *feat_names[63] = {
+    "Voltage","Measured","Min","Max","Standard_Deviation","Average","Median",
+    "Bounce_Back","Drop","Slope_Bounce_Back","Slope_Drop",
+    "Min_Volt_Below_19","Max_Volt_19_Above",
+    "Start_Voltage","Time_To_Min_Ms","Recovery_Time_ms",
+    "Area_0_200ms","Count_Below7","Count_Below9","Count_Below10",
+    "Curve_Kurtosis","Curve_Skew",
+    "Max_Rise_Rate_0_180","Max_Fall_Rate_0_180",
+    "Mean_Abs_Slope_0_180","Std_Slope_0_180","Mean_Abs_Accel_0_180",
+    "Max_Accel_0_180","Min_Accel_0_180","Norm_Energy_200ms",
+    "Rec_Slope","R_est",
+    "Spike_Count","Dip_Count","Spike_Prom_Sum","Spike_Width_Mean_Ms",
+    "Longest_Flat","Hf_Energy","Spectral_Entropy","Roll_Var",
+    "Edge_Start_Diff","Edge_End_Diff","Min_Drop","Recovery_Slope",
+    "Poly_Resid","Segment_Slope_Var","Zero_Cross_Rate",
+    "Step_Count_Sustained","Max_Step_Mag","Bp_Low","Bp_Mid","Bp_High",
+    "Bp_Mid_Ratio","Bp_High_Ratio","Resid_Spectral_Entropy",
+    "Rel_Below_Frac","Rel_Below_Longest_Ms","Win_Range_Max",
+    "Tail_Std","Tail_Ac1","Crest_Factor","Line_Length",
+    "Mid_Duty_Cycle_Low"
     };
     fprintf(fo, "Test_Record_Detail_ID");
     for (int i=0;i<42;i++) fprintf(fo, ",%s", feat_names[i]);
@@ -164,9 +177,11 @@ static int is_blank_csv_line(const char *s) {
 
 static void write_row(FILE *fo, const char *id, const float features[42]) {
     fprintf(fo, "\"%s\"", id ? id : "");
-    for (int i=0;i<42;i++) {
-        if (isnan(features[i])) fprintf(fo, ",");
-        else                    fprintf(fo, ",%.6f", features[i]);
+    for (int i=0;i<63;i++) {
+        if (isnan(features[i])) 
+            fprintf(fo, ",");
+        else                    
+        fprintf(fo, ",%.6f", features[i]);
     }
     fprintf(fo, "\n");
 }

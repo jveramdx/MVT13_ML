@@ -4,5 +4,26 @@
         "MLTable": "yaml",
         "features.h": "c",
         "numpy_functions.h": "c"
-    }
+    },
+    "cSpell.ignoreWords": [
+        "Ptot",
+        "Wmin",
+        "accw",
+        "autocorr",
+        "bandpowers",
+        "derivs",
+        "kseg",
+        "medfilt",
+        "nanargmin",
+        "nanmax",
+        "nanmean",
+        "nanmedian",
+        "nanmin",
+        "nanstd",
+        "ndiff",
+        "numpy",
+        "rfftfreq",
+        "sust",
+        "yhat"
+    ]
 }
