@@ -5,19 +5,19 @@ import csv
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, cast
 
 import numpy as np
 from scipy.signal import find_peaks, medfilt
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATASET_PATH = SCRIPT_DIR.parent / "Preprocessed_Datasets" / "MVT13_Starter_Voltage_Array.csv"
+DATASET_PATH = SCRIPT_DIR.parent.parent / "Preprocessed_Datasets" / "MVT13_Starter_Voltage_Array.csv"
 TEST_BIN = SCRIPT_DIR / ("test_numpy_functions.exe" if os.name == "nt" else "test_numpy_functions")
 METHODS = ("fft", "rfftfreq", "find_peaks", "medfilt")
 
 
-def load_samples(limit: int = 50) -> List[Dict[str, np.ndarray]]:
-    samples: List[Dict[str, np.ndarray]] = []
+def load_samples(limit: int = 50) -> List[Dict[str, object]]:
+    samples: List[Dict[str, object]] = []
     with open(DATASET_PATH, newline="") as fp:
         reader = csv.reader(fp)
         next(reader, None)  # header
@@ -89,7 +89,7 @@ SERIALIZERS = {
 }
 
 
-def run_c_tests(method: str) -> Dict[str, Dict[int, Dict[str, np.ndarray]]]:
+def run_c_tests(method: str) -> Dict[str, Dict[int, Dict[str, object]]]:
     if not TEST_BIN.exists():
         raise FileNotFoundError(f"C test binary not found at {TEST_BIN}")
 
@@ -98,7 +98,7 @@ def run_c_tests(method: str) -> Dict[str, Dict[int, Dict[str, np.ndarray]]]:
         cmd.append(method)
 
     raw = subprocess.check_output(cmd, text=True, cwd=str(SCRIPT_DIR))
-    results: Dict[str, Dict[int, Dict[str, np.ndarray]]] = {}
+    results: Dict[str, Dict[int, Dict[str, object]]] = {}
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -116,12 +116,12 @@ def run_c_tests(method: str) -> Dict[str, Dict[int, Dict[str, np.ndarray]]]:
             continue
         parser = PARSERS[name]
         parsed = parser(payload)
-        results.setdefault(name, {})[sample_idx] = {
+        group = results.setdefault(name, {})
+        group[sample_idx] = {
             "record_id": record_id,
             "values": parsed,
         }
     return results
-
 
 def compute_python_reference(method: str, values: np.ndarray) -> np.ndarray:
     if method == "fft":
@@ -143,7 +143,7 @@ def compute_python_reference(method: str, values: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported method {method}")
 
 
-def difference_metric(method: str, python_values: np.ndarray, c_values: Optional[np.ndarray]) -> float:
+def difference_metric(method: str, python_values: np.ndarray, c_values: Optional[np.ndarray]) -> float: # pyright: ignore[reportRedeclaration]
     if c_values is None:
         return float("nan")
     if method == "find_peaks":
@@ -158,7 +158,7 @@ def difference_metric(method: str, python_values: np.ndarray, c_values: Optional
     return float(np.max(diff))
 
 
-def serialize(method: str, values: Optional[np.ndarray]) -> str:
+def serialize(method: str, values: Optional[np.ndarray]) -> str: # type: ignore
     if values is None:
         return ""
     if values.size == 0:
@@ -167,7 +167,7 @@ def serialize(method: str, values: Optional[np.ndarray]) -> str:
     return serializer(values)
 
 
-def main() -> None:
+def main() -> None: # type: ignore
     parser = argparse.ArgumentParser(description="Compare C numpy-function mimics against NumPy/SciPy using dataset samples.")
     parser.add_argument(
         "--method",
@@ -185,14 +185,14 @@ def main() -> None:
     comparison_rows: List[Dict[str, object]] = []
     for method in methods_to_run:
         for sample in samples:
-            idx = sample["index"]
-            record_id = sample["record_id"]
-            values = sample["values"]
+            idx = cast(int, sample["index"])
+            record_id = cast(int, sample["record_id"])
+            values = cast(np.ndarray, sample["values"])
             py_values = compute_python_reference(method, values)
             c_entry = c_results.get(method, {}).get(idx)
             c_values = None
             if c_entry and c_entry["record_id"] == record_id:
-                c_values = c_entry["values"]
+                c_values = cast(Optional[np.ndarray], c_entry["values"])
             diff = difference_metric(method, py_values, c_values)
             print(f"{method} sample {idx} (record {record_id}): diff metric = {diff}")
             comparison_rows.append(

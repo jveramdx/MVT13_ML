@@ -70,6 +70,7 @@ float nanstd (const float* arr, int n);
 float nanmedian(const float* arr, int n);
 float nan_kurtosis(const float* arr, int n);
 float nan_skew     (const float* arr, int n);
+float mad_sigma_f32(const float* x, int32_t n);
 
 // ---------------- Small utilities that mirror NumPy behavior ----------------
 

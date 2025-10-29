@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <complex.h>
 #include <stdint.h>
+#include "numpy_functions.h"
 
 // ---------- local helpers (domain-specific; keep available for testing) ----------
 void slice_segments(const float *fvalues, int16_t n,
@@ -165,6 +166,7 @@ float autocorr_lag1(const float *x, int n){
     if (den<=0.0) return 0.0f;
     return (float)(num/den);
 }
+
 
 // ---------- public API ----------
 void compute_features(const float fvalues[], int16_t n, Record *out, float voltage, int16_t measured)
@@ -567,3 +569,5 @@ void compute_features(const float fvalues[], int16_t n, Record *out, float volta
     out->tail_ac1 = tail_ac1;              out->crest_factor = crest_factor;
     out->line_length = line_length;        out->mid_duty_cycle_low = mid_duty_cycle_low;
 }
+
+

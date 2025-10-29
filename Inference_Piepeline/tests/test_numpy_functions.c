@@ -12,7 +12,7 @@
 
 #define MAX_SAMPLES 50
 #define LINE_BUFFER 65536
-#define DATASET_PATH "../Preprocessed_Datasets/MVT13_Starter_Voltage_Array.csv"
+#define DATASET_PATH "../../Preprocessed_Datasets/MVT13_Starter_Voltage_Array.csv"
 
 typedef struct {
     long long record_id;

@@ -499,6 +499,42 @@ float nan_skew(const float* a, int n){
     return sqrtf((float)cnt*((float)cnt-1.0f))/((float)cnt-2.0f) * g1;
 }
 
+float mad_sigma_f32(const float* x, int32_t n){
+    if (!x || n <= 0) return 0.0f;
+    float *buf = (float*)xmalloc(sizeof(float) * (size_t)n);
+    int32_t m = 0;
+    for (int32_t i = 0; i < n; ++i){
+        float v = x[i];
+        if (!isnan(v)) buf[m++] = v;
+    }
+    if (m == 0){
+        free(buf);
+        return 0.0f;
+    }
+    qsort(buf, (size_t)m, sizeof(float), cmp_f32_qsort);
+    float median = (m & 1) ? buf[m/2] : 0.5f * (buf[m/2 - 1] + buf[m/2]);
+    for (int32_t i = 0; i < m; ++i) buf[i] = fabsf(buf[i] - median);
+    qsort(buf, (size_t)m, sizeof(float), cmp_f32_qsort);
+    float mad = (m & 1) ? buf[m/2] : 0.5f * (buf[m/2 - 1] + buf[m/2]);
+    free(buf);
+    const float SCALE = 1.48260221851f;
+    float sigma = mad * SCALE;
+    return (sigma > 0.0f) ? sigma : 0.0f;
+}
+
+// ---------- 1D valid-mode convolution y = conv(x, h), valid only ----------
+void conv_valid_f32(const float* x, int32_t nx,
+                           const float* h, int32_t nh,
+                           float* y /* len = nx - nh + 1 */){
+    int32_t ny = nx - nh + 1;
+    for(int32_t i=0;i<ny;++i){
+        float acc = 0.0f;
+        for(int32_t k=0;k<nh;++k) acc += x[i+k] * h[k];
+        y[i] = acc;
+    }
+}
+
+
 // ============================ tiny numpy-like utils ============================
 
 int32_t nanargmin_first_n(const float* x, int32_t n){
